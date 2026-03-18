@@ -1,194 +1,219 @@
 import asyncio
 import os
 import sys
-import time
-import aiohttp
+import httpx
+import ssl
+import traceback
+import subprocess
+from PIL import Image
+from io import BytesIO
 from dotenv import load_dotenv
 from loguru import logger
-from PIL import Image
+
+# 🚨 최후의 전역 SSL 무력화 (OpenAI 인증서 이슈 대응)
+try:
+    ssl._create_default_https_context = ssl._create_unverified_context
+    os.environ["CURL_CA_BUNDLE"] = ""
+    os.environ["SSL_CERT_FILE"] = ""
+except:
+    pass
 
 from pipecat.frames.frames import (
     Frame, 
-    TextFrame, 
-    UserStartedSpeakingFrame, 
-    UserStoppedSpeakingFrame,
-    LLMRunFrame,
-    EndFrame,
-    URLImageRawFrame,
-    StartFrame
+    StartFrame,
+    TTSSpeakFrame,
+    ImageRawFrame
 )
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineTask
-from pipecat.processors.aggregators.llm_context import LLMContext
-from pipecat.processors.aggregators.llm_response_universal import (
-    LLMContextAggregatorPair,
-)
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
-from pipecat.services.openai.llm import OpenAILLMService
-from pipecat.services.openai.image import OpenAIImageGenService
-from pipecat.services.deepgram.tts import DeepgramTTSService
-from pipecat.transports.local.audio import LocalAudioTransport, LocalAudioTransportParams
+from pipecat.services.openai.tts import OpenAITTSService
+
+# 🚨 Daily SDK Import 검증 (V44)
+try:
+    import daily
+    # AudioData가 실제로 있는지 확인
+    from pipecat.transports.services.daily import DailyTransport, DailyTransportParams
+    DAILY_AVAILABLE = True
+    print("✅ Daily SDK successfully imported.")
+except ImportError as e:
+    print(f"🚩 Daily SDK not found or shadowing persists: {e}")
+    DAILY_AVAILABLE = False
+except Exception as e:
+    print(f"🚩 General Daily Import error: {e}")
+    DAILY_AVAILABLE = False
 
 load_dotenv(override=True)
-
-# 로그 설정
 logger.remove()
-logger.add(sys.stderr, format="<green>{time:HH:mm:ss.SSS}</green> | <level>{message}</level>", level="INFO")
 
-bot_finished_event = asyncio.Event()
+# 상태 제어
+bot_ready_event = asyncio.Event()
 
-# --- 이미지 프롬프트를 감지하고 필터링하는 프로세서 ---
-class TurboImageTrigger(FrameProcessor):
-    def __init__(self, image_gen_service):
+class RecoveryEngineV44(FrameProcessor):
+    def __init__(self, openai_key):
         super().__init__()
-        self._image_gen_service = image_gen_service
-        self._full_text = ""
+        self._openai_key = openai_key.strip()
+        self._http_client = httpx.AsyncClient(verify=False, timeout=60.0)
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
-        # CRITICAL: 반드시 super().process_frame을 호출해야 StartFrame 오류가 나지 않음
-        await super().process_frame(frame, direction)
-        
-        if isinstance(frame, TextFrame):
-            self._full_text += frame.text
-            
-            # "IMAGE_PROMPT:" 발견된 이후는 다음 단계(TTS/Sink)로 보내지 않음
-            if "IMAGE_PROMPT:" in self._full_text:
-                if "IMAGE_PROMPT:" in frame.text:
-                    clean_text = frame.text.split("IMAGE_PROMPT:")[0]
-                    if clean_text.strip():
-                        await self.push_frame(TextFrame(clean_text), direction)
-                return
-            
-            await self.push_frame(frame, direction)
-            
-        elif frame.__class__.__name__ == "LLMFullResponseEndFrame":
-            if "IMAGE_PROMPT:" in self._full_text:
-                try:
-                    prompt = self._full_text.split("IMAGE_PROMPT:")[1].strip()
-                    if prompt:
-                        print(f"\n[SYSTEM] Creating art for: {prompt[:50]}...")
-                        asyncio.create_task(self._trigger_image_gen(prompt))
-                except Exception as e:
-                    print(f"\n[ERROR] Prompt extraction failed: {e}")
-            
-            self._full_text = ""
-            await self.push_frame(frame, direction)
-        
-        # StartFrame이나 다른 제어 프레임들은 super()에서 이미 처리되어 전달됨
-        # (이미 process_frame 상단에서 super()를 불렀으므로 TextFrame/EndFrame이 아닌 경우만 중복 방지를 위해 조심)
-        elif not isinstance(frame, (TextFrame)):
-            # 이미 위에서 처리되지 않은 프레임들(StartFrame 등)은 Pass-through
-            # 사실 super().process_frame이 내부적으로 push_frame을 할 수도 있으므로 구조 주의
-            pass
+        if isinstance(frame, StartFrame):
+            await super().process_frame(frame, direction)
+            bot_ready_event.set()
+        else:
+            await super().process_frame(frame, direction)
 
-    async def _trigger_image_gen(self, prompt):
+    async def dual_voice_v44(self, text, filename, task):
+        print(f"[VOICE] 🎙️ Processing Voice for: {text[:20]}...")
         try:
-            async for frame in self._image_gen_service.run_image_gen(prompt):
-                await self.push_frame(frame)
+            res = await self._http_client.post(
+                "https://api.openai.com/v1/audio/speech",
+                headers={"Authorization": f"Bearer {self._openai_key}"},
+                json={"model": "tts-1", "input": text, "voice": "alloy"}
+            )
+            if res.status_code == 200:
+                with open(filename, "wb") as f:
+                    f.write(res.content)
+                os.startfile(os.path.abspath(filename))
+                if DAILY_AVAILABLE:
+                    await task.queue_frame(TTSSpeakFrame(text))
+            else:
+                print(f"⚠️ TTS HTTP Error: {res.status_code} - {res.text}")
         except Exception as e:
-            print(f"\n[ERROR] Image generation failed: {e}")
+            print(f"⚠️ Voice step failed: {e}")
 
-# --- 결과 출력 및 이미지 표시 싱크 ---
-class TurboStorySink(FrameProcessor):
-    def __init__(self):
-        super().__init__()
-        self._input_time = 0
-        self._first_text_time = 0
+    async def run_v44(self, theme, task):
+        print(f"\n[PHASE 1] 📖 Generating Story...")
+        try:
+            # 1. 시나리오 생성
+            res = await self._http_client.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={"Authorization": f"Bearer {self._openai_key}"},
+                json={
+                    "model": "gpt-4o-mini",
+                    "messages": [{"role": "system", "content": "2-sentence storyteller. End with 'IMG: ' and 3 words."},
+                                 {"role": "user", "content": theme}]
+                }
+            )
+            
+            if res.status_code != 200:
+                print(f"❌ OpenAI LLM Error: {res.status_code} - {res.text}")
+                return
 
-    async def process_frame(self, frame: Frame, direction: FrameDirection):
-        await super().process_frame(frame, direction)
-        
-        if isinstance(frame, TextFrame):
-            if not self._first_text_time:
-                self._first_text_time = time.time()
-                elapsed = self._first_text_time - self._input_time
-                print(f"\n[TIME] TTFT: {elapsed:.2f}s")
-                print("BOT: ", end="", flush=True)
-            print(frame.text, end="", flush=True)
+            content = res.json()["choices"][0]["message"]["content"]
+            parts = content.split("IMG:")
+            story_text = parts[0].strip()
+            img_key = parts[1].strip() if len(parts) > 1 else theme
+            
+            print(f"🤖 BOT STORY: {story_text}")
+            await self.dual_voice_v44(story_text, "story_voice.mp3", task)
 
-        elif isinstance(frame, URLImageRawFrame):
-            import io
-            elapsed = time.time() - self._input_time
-            print(f"\n[TIME] Image Ready in {elapsed:.2f}s! Opening...")
-            image = Image.open(io.BytesIO(frame.image))
-            image.show()
+            # 2. 이미지 생성
+            print(f"\n[PHASE 2] 🎨 Generating DALL-E Image...")
+            img_res = await self._http_client.post(
+                "https://api.openai.com/v1/images/generations",
+                headers={"Authorization": f"Bearer {self._openai_key}"},
+                json={"model": "dall-e-3", "prompt": img_key, "n": 1, "size": "1024x1024"}
+            )
+            
+            if img_res.status_code != 200:
+                print(f"⚠️ Image generation error: {img_res.status_code} - {img_res.text}")
+            else:
+                img_url = img_res.json()["data"][0]["url"]
+                print(f"✅ Image URL received. Downloading...")
+                img_data_res = await self._http_client.get(img_url)
+                if img_data_res.status_code == 200:
+                    with open("story_image.png", "wb") as f:
+                        f.write(img_data_res.content)
+                    print(f"🖼️ Saved: {os.path.abspath('story_image.png')}")
+                    
+                    if DAILY_AVAILABLE:
+                        print("🖼️ Pushing Image to Daily...")
+                        img = Image.open(BytesIO(img_data_res.content)).convert("RGB")
+                        await task.queue_frame(ImageRawFrame(image=img.tobytes(), size=img.size, format="RGB"))
+                else:
+                    print(f"⚠️ Image download error: {img_data_res.status_code}")
 
-        elif frame.__class__.__name__ == "LLMFullResponseStartFrame":
-            bot_finished_event.clear()
-            print("AI is imagining and writing...", end="", flush=True)
-
-        elif frame.__class__.__name__ == "LLMFullResponseEndFrame":
-            print("\n")
-            bot_finished_event.set()
+            # 3. 해설
+            print(f"\n[PHASE 3] 🔍 Creating Narration...")
+            n_res = await self._http_client.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={"Authorization": f"Bearer {self._openai_key}"},
+                json={
+                    "model": "gpt-4o-mini",
+                    "messages": [{"role": "system", "content": "1 cool sentence image description."},
+                                 {"role": "user", "content": f"Describe: {img_key}"}]
+                }
+            )
+            if n_res.status_code == 200:
+                narration = n_res.json()["choices"][0]["message"]["content"]
+                print(f"🤖 NARRATION: {narration}")
+                await self.dual_voice_v44(narration, "narration_voice.mp3", task)
+                
+        except Exception as e:
+            print(f"❌ V44 CRITICAL ENGINE ERROR:")
+            traceback.print_exc()
 
 async def main():
-    async with aiohttp.ClientSession() as session:
-        transport = LocalAudioTransport(LocalAudioTransportParams(audio_in_enabled=False, audio_out_enabled=True))
+    openai_key = os.getenv("OPENAI_API_KEY")
+    daily_url = os.getenv("DAILY_ROOM_URL", "https://practice2.daily.co/practice2")
 
-        llm = OpenAILLMService(
-            api_key=os.getenv("OPENAI_API_KEY"),
-            model="gpt-4o-mini",
-            settings=OpenAILLMService.Settings(
-                system_instruction="You are a 2-sentence storyteller. Write a very brief story. END with ' IMAGE_PROMPT: ' + a visual description.",
+    pipeline_components = []
+    engine = RecoveryEngineV44(openai_key)
+    pipeline_components.append(engine)
+
+    # 🎙️ TTS 서비스
+    tts = OpenAITTSService(api_key=openai_key, voice="alloy")
+    pipeline_components.append(tts)
+
+    # 🌐 Daily 연동
+    if DAILY_AVAILABLE:
+        try:
+            transport = DailyTransport(
+                room_url=daily_url,
+                token=None,
+                bot_name="StoryBotV44",
+                params=DailyTransportParams(
+                    audio_out_enabled=True,
+                    video_out_enabled=True,
+                    camera_out_enabled=True,
+                    camera_out_width=1024,
+                    camera_out_height=1024
+                )
             )
-        )
+            pipeline_components.append(transport.output())
+        except Exception as daily_err:
+            print(f"⚠️ Daily hand-shake error: {daily_err}. Running local mode.")
+    else:
+        pipeline_components.append(FrameProcessor())
 
-        image_gen = OpenAIImageGenService(
-            api_key=os.getenv("OPENAI_API_KEY"),
-            aiohttp_session=session,
-            model="dall-e-3",
-        )
+    pipeline = Pipeline(pipeline_components)
+    task = PipelineTask(pipeline)
+    runner = PipelineRunner(handle_sigint=True)
 
-        tts = DeepgramTTSService(api_key=os.getenv("DEEPGRAM_API_KEY"), voice="aura-asteria-en")
+    async def input_loop():
+        try:
+            await asyncio.wait_for(bot_ready_event.wait(), timeout=5.0)
+        except:
+            pass
 
-        context = LLMContext()
-        user_aggregator, assistant_aggregator = LLMContextAggregatorPair(context)
-        
-        trigger = TurboImageTrigger(image_gen)
-        sink = TurboStorySink()
+        print("\n" + "*"*50)
+        print("🎭 STORYTELLER V44: STABLE MULTIMODAL ENGINE")
+        print("*"*50)
+        while True:
+            theme = await asyncio.to_thread(input, "\n[THEME] : ")
+            if theme.lower() in ["exit", "q"]: break
+            if not theme.strip(): continue
+            await engine.run_v44(theme, task)
+            await asyncio.sleep(2)
 
-        pipeline = Pipeline([
-            user_aggregator,
-            llm,
-            trigger,
-            tts,
-            transport.output(),
-            sink,
-            assistant_aggregator
-        ])
-
-        task = PipelineTask(pipeline)
-        runner = PipelineRunner(handle_sigint=True)
-
-        async def input_loop():
-            # 파이프라인 신호가 안정될 때까지 충분히 대기
-            await asyncio.sleep(2.0)
-            print("\n--- TURBO Storyteller (V4: Internal Errors Fixed) ---")
-            print("Theme: 'Cyberpunk ramen shop', 'Cat on Jupiter', etc.")
-            bot_finished_event.set()
-            
-            while True:
-                await bot_finished_event.wait()
-                user_input = await asyncio.to_thread(input, "\nTHEME: ")
-                if not user_input.strip(): continue
-                if user_input.lower() in ["exit", "quit"]:
-                    await task.queue_frame(EndFrame()); break
-                
-                sink._input_time = time.time()
-                bot_finished_event.clear()
-                
-                await task.queue_frames([
-                    UserStartedSpeakingFrame(),
-                    TextFrame(user_input),
-                    UserStoppedSpeakingFrame(),
-                    LLMRunFrame()
-                ])
-
-        await asyncio.gather(runner.run(task), input_loop())
+    await asyncio.gather(runner.run(task), input_loop())
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
-    except (KeyboardInterrupt, asyncio.CancelledError):
+    except KeyboardInterrupt:
         pass
+    except Exception as e:
+        print(f"\n[SYSTEM CRITICAL] {e}")
+        traceback.print_exc()
