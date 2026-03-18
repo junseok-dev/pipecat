@@ -1,0 +1,9 @@
+pipecat-ai[openai,deepgram]
+deepgram-sdk
+daily-python
+python-dotenv
+aiohttp
+loguru
+pillow
+soundfile
+resampy
